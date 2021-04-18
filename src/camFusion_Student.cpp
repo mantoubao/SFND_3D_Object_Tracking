@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <assert.h>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
@@ -138,7 +139,50 @@ void show3DObjects(std::vector<BoundingBox> &boundingBoxes, cv::Size worldSize, 
 // associate a given bounding box with the keypoints it contains
 void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, std::vector<cv::DMatch> &kptMatches)
 {
-    // ...
+    vector<double> distance;
+    for(auto kptmatch:kptMatches)
+    {
+        cv::KeyPoint curr_kpt = kptsCurr.at(kptmatch.trainIdx);
+        
+        if (!boundingBox.roi.contains(curr_kpt.pt)){
+            continue;
+        }
+
+        cv::KeyPoint prev_kpt = kptsPrev.at(kptmatch.queryIdx);
+        double ptdist= cv::norm(curr_kpt.pt - prev_kpt.pt);
+
+        distance.push_back(ptdist);
+
+    }
+
+    double mean_dist= accumulate(distance.begin(), distance.end(),0.0)/distance.size();
+    // size_t dist_size= distance.size();
+    // if(dist_size!=0){
+    //     sort(distance.begin(), distance.end());
+    //     if(dist_size%2==0){
+    //         median_dist=(distance[dist_size/2-1]+distance[dist_size/2])/2;
+    //     }
+    //     else{
+    //         median_dist=distance[dist_size/2];
+    //     }
+
+    // }
+
+    //filter outlier based on median distance
+    for(auto kptmatch:kptMatches){
+        cv::KeyPoint curr_kpt = kptsCurr.at(kptmatch.trainIdx);
+        if (!boundingBox.roi.contains(curr_kpt.pt)){
+            continue;
+        }
+
+        cv::KeyPoint prev_kpt = kptsPrev.at(kptmatch.queryIdx);
+        double ptdist= cv::norm(curr_kpt.pt - prev_kpt.pt);
+        if(ptdist<mean_dist*1.2 ){
+            boundingBox.kptMatches.push_back(kptmatch);
+        }
+
+    }
+
 }
 
 
@@ -146,18 +190,141 @@ void clusterKptMatchesWithROI(BoundingBox &boundingBox, std::vector<cv::KeyPoint
 void computeTTCCamera(std::vector<cv::KeyPoint> &kptsPrev, std::vector<cv::KeyPoint> &kptsCurr, 
                       std::vector<cv::DMatch> kptMatches, double frameRate, double &TTC, cv::Mat *visImg)
 {
-    // ...
+    vector<double> vdistratios;
+    double minDist =100.0;
+    for(auto itr1=kptMatches.begin(); itr1!=kptMatches.end()-1; ++itr1)
+    {
+        cv::KeyPoint curr_kpt_outer = kptsCurr.at(itr1->trainIdx);
+        cv::KeyPoint prev_kpt_outer = kptsPrev.at(itr1->queryIdx);
+
+        for(auto itr2=kptMatches.begin()+1; itr2!=kptMatches.end(); ++itr2)
+        {
+            cv::KeyPoint curr_kpt_inner = kptsCurr.at(itr2->trainIdx);
+            cv::KeyPoint prev_kpt_inner = kptsPrev.at(itr2->queryIdx);
+
+            double dist_curr=cv::norm(curr_kpt_outer.pt - curr_kpt_inner.pt);
+            double dist_prev=cv::norm(prev_kpt_outer.pt-prev_kpt_inner.pt);
+
+            if(dist_prev>std::numeric_limits<double>::epsilon() && dist_curr>=minDist){
+                double distratio= dist_curr/dist_prev;
+                vdistratios.push_back(distratio);
+            }
+
+        }
+    }
+
+    if(vdistratios.size()==0){
+        TTC=NAN;
+        return;
+    }
+
+    sort(vdistratios.begin(),vdistratios.end());
+    double median_ratio=0.0;
+    size_t vratio_size= vdistratios.size();
+    
+    if(vratio_size%2==0){
+        median_ratio=(vdistratios[vratio_size/2-1]+vdistratios[vratio_size/2])/2;
+    }
+    else{
+        median_ratio=vdistratios[vratio_size/2];
+    }
+
+    double deltaT= 1/frameRate;
+    TTC=-deltaT/(1-median_ratio);
+    
+}
+
+void computeMeanStdvariance(const std::vector<LidarPoint> & points, double & mean, double & stdvariance)
+{
+    double sum = 0.0;
+    for(auto point:points){
+        sum+=point.x;
+    }
+    mean=sum/points.size();
+
+    double variance=0.0;
+    for(auto point:points){
+        variance+=(point.x-mean)*(point.x-mean)/points.size();
+    }
+    stdvariance=sqrt(variance);
+
+}
+
+double calMinX(const std::vector<LidarPoint> & points, const double mean, const double std, double thrsholdfactor){
+    double MinX= 1e9;
+    for(auto point:points){
+        if(point.x < mean-thrsholdfactor*std || point.x> mean+thrsholdfactor*std )
+            continue;
+
+        MinX= point.x<MinX?point.x:MinX;
+
+    }
+    return MinX;
 }
 
 
 void computeTTCLidar(std::vector<LidarPoint> &lidarPointsPrev,
                      std::vector<LidarPoint> &lidarPointsCurr, double frameRate, double &TTC)
 {
-    // ...
+    double deltaT= 1/frameRate;
+    double pre_mean, pre_stdvar, cur_mean, cur_stdvar;
+
+    computeMeanStdvariance(lidarPointsPrev,pre_mean,pre_stdvar);
+    computeMeanStdvariance(lidarPointsCurr,cur_mean,cur_stdvar);
+
+    double MinXPrev=calMinX(lidarPointsPrev, pre_mean,pre_stdvar,1.5);
+    double MinXCurr=calMinX(lidarPointsCurr, cur_mean,cur_stdvar,1.5);
+
+    TTC=MinXCurr*deltaT/(MinXPrev-MinXCurr);
+
 }
 
 
 void matchBoundingBoxes(std::vector<cv::DMatch> &matches, std::map<int, int> &bbBestMatches, DataFrame &prevFrame, DataFrame &currFrame)
 {
-    // ...
+    const int pre_bb_size =prevFrame.boundingBoxes.size();
+    const int cur_bb_size = currFrame.boundingBoxes.size();
+    vector<vector<int>> matching_scores(pre_bb_size, vector<int>(cur_bb_size,0) );
+    for(auto match : matches)
+    {
+        cv::KeyPoint pre_keypoint = prevFrame.keypoints[match.queryIdx];
+        cv::Point pre_point (pre_keypoint.pt.x, pre_keypoint.pt.y);
+
+        cv::KeyPoint cur_keypoint = currFrame.keypoints[match.trainIdx];
+        cv::Point cur_point (cur_keypoint.pt.x, cur_keypoint.pt.y);
+
+        int pre_bb_index=-1;
+        for(int i = 0;i<pre_bb_size;++i){
+            if(prevFrame.boundingBoxes[i].roi.contains(pre_point)){
+                pre_bb_index = i;
+                 break;
+            }               
+        }
+
+        int cur_bb_index=-1;
+        for(int i=0;i<cur_bb_size; ++i){
+            if(currFrame.boundingBoxes[i].roi.contains(cur_point)){
+                cur_bb_index=i;
+                break;
+            }
+        }
+
+        //ignore if keypoint not in any bounding boxes
+        if(pre_bb_index==-1||cur_bb_index==-1)
+            continue;
+
+        matching_scores.at(pre_bb_index).at(cur_bb_index)+=1; 
+
+    }
+    
+    for(int pre_matchingID=0;pre_matchingID<matching_scores.size();++pre_matchingID){
+        auto max_idx=max_element(matching_scores.at(pre_matchingID).begin(),matching_scores.at(pre_matchingID).end());
+        if (*max_idx>0){
+            int cur_matchingID=distance(matching_scores.at(pre_matchingID).begin(),max_idx);
+            //cout<<"cur_matchingID ="<<cur_matchingID<<"  matching_cur_index="<<pre_matchingID<<endl;
+            bbBestMatches[pre_matchingID]=cur_matchingID;
+        }
+        
+    }
+        
 }
